@@ -57,17 +57,17 @@ def find_shared_tasks(db):
             continue
         rx = re.compile('\(((?:@|#)[^)]+)\)$')
         match = rx.search(note)
-        ## WARNING the below code is by no means efficient
         if match:
-            id = task.attrib['id']
+            elements = [task]
+            children = get_task_children(db, [task.attrib['id']])
+            while children:
+                child = children.pop(0)
+                elements.append(child)
+                children += get_task_children(db, child)
             for name in match.groups()[0].split(','):
-                result[name.strip()] = result.get(name.strip(), [])
-                result[name.strip()].append(task)
-                children = get_task_children(db, [id])
-                while children:
-                    child = children.pop(0)
-                    result[name.strip()].append(child)
-                    children += get_task_children(db, child)
+                key = name.strip()
+                result[key] = result.get(key, [])
+                result[key] += elements
     return result
 
 def get_task_children(db, ids):
