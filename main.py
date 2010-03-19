@@ -82,5 +82,3 @@ if __name__ == '__main__':
     print etree.tostring(db, pretty_print=True)
     from pprint import pprint
     pprint(find_shared_tasks(db))
-
-db = merge_db(False)
