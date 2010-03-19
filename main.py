@@ -23,28 +23,28 @@ def merge_db(full=True):
         # this will require creating .client
         # files and looking for them here
     for tree in trees:
-        # find all the tasks in the delta files
-        tasks = xpath(tree, '//of:omnifocus/of:task')
-        for task in tasks:
-            op = task.attrib.get('op', None)
-            if op == 'update':
-                # if the task has op=update then replace
-                # the task element in `main` with the new element
-                try:
-                    orig_task = xpath(main, "/of:omnifocus/of:task[@id='%s']" % task.attrib['id'])[0]
-                    main.getroot().remove(orig_task)
-                except IndexError:
+        # find all the contexts and tasks in the deltas
+        for node_type in ('context', 'task'):
+            for el in xpath(tree, '/of:omnifocus/of:%s' % node_type):
+                op = el.attrib.get('op', None)
+                if op == 'update':
+                    # if the task has op=update then replace
+                    # the task element in `main` with the new element
+                    try:
+                        orig = xpath(main, "/of:omnifocus/of:%s[@id='%s']" % (node_type, el.attrib['id']))[0]
+                        main.getroot().remove(orig)
+                    except IndexError:
+                        pass
+                    ## FIXME this smells like it'll go bad when full=False
+                    # if we are preparing a delta for another's consumation
+                    # we'll want to add the op=update dynamically
+                    del(el.attrib['op'])
+                    main.getroot().append(el)
+                elif op == 'delete':
                     pass
-                ## FIXME this smells like it'll go bad when full=False
-                # if we are preparing a delta for another's consumation
-                # we'll want to add the op=update dynamically
-                del(task.attrib['op'])
-                main.getroot().append(task)
-            elif op == 'delete':
-                pass
-            elif op is None:
-                # no operation implies a new task
-                main.getroot().append(task)
+                elif op is None:
+                    # no operation implies a new element
+                    main.getroot().append(el)
     return main
 
 def find_shared_tasks(db):
