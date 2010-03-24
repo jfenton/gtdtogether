@@ -27,7 +27,19 @@ import sqlite3
 import random
 from zipfile import ZipFile
 
-from lxml import etree
+from lxml import etree, objectify
+
+
+class GTDDBRow(object):
+    def __init__(self, username, row):
+        self.username = username
+        self.row = dict((col, row[col]) for col in row.keys())
+
+    def __getattr__(self, name):
+        try:
+            return self.row[name]
+        except KeyError:
+            raise AttributeError
 
 
 class GTDDB(object):
@@ -35,16 +47,13 @@ class GTDDB(object):
     tables = ('config', 'delegate_contexts')
 
     def __init__(self, username):
-        self.username = None
+        self.username = username
         self.conn = sqlite3.connect('db.sqlite')
         self.conn.row_factory = sqlite3.Row
         cursor = self.conn.cursor()
         for table in GTDDB.tables:
-            setattr(self, table, object())
             cursor.execute('SELECT * FROM %s WHERE username=?' % table, (self.username,))
-            row = cursor.fetchone()
-            for col in row.keys():
-                setattr(getattr(self, table), col, row[col])
+            setattr(self, table, GTDDBRow(username, cursor.fetchone()))
 
 
 class OmniDate(datetime):
@@ -59,13 +68,85 @@ class OmniDate(datetime):
     def xml(self):
         return '%sZ' % self.isoformat()[:-3]
 
+class OmniNode(object):
+    """ Generic class to provide an interface to the OmniFocus task heirarchy. """
+    def __init__(self, el):
+        if el.get('idref'):
+            try:
+                el = self.xpath('/of:omnifocus/of:%s[@id="%s"]' % (el.tag, el.get('idref')))[0]
+            except IndexError:
+                return OmniDB.ElementNotFound
+        self.el = el
+
+    def xpath(self, query, base=None):
+        # methinks using OmniDB instance methods like this is bad.
+        return OmniNode(el for el in OmniDB.xpath(None, query, base))
+
+    @property
+    def id(self):
+        return self.el.get('id')
+
+    @property
+    def name(self):
+        return self.el.name.text
+
+    @property
+    def parent(self):
+        """ Attempt to find a parent task, project, or folder. """
+        if self.el.task:
+            id = self.el.task.get('idref')
+        else:
+            try:
+                id = self.project.folder.id
+            except AttributeError:
+                return None
+        try:
+            return self.xpath('/of:omnifocus/of:folder|of:task[@id="%s"]' % id)[0]
+        except IndexError:
+            pass
+        return None
+
+    @property
+    def children(self):
+        return self.xpath('//of:%s[@idref="%s"]/..' % (self.el.tag, self.el.get('id')))
+
+    @property
+    def path(self):
+        """ Returns the "path" of a node
+
+            "Company One : Project A : Task : Subtask" would return
+            ['Company One', 'Project A', 'Task', 'Subtask']
+        """
+        ascendents = [self.name]
+        parent = self.parent
+        while parent:
+            ascendents.append(parent.name)
+            parent = self.parent
+        return ascendents[::-1]
+
+    @property
+    def project(self):
+        return OmniNode(self.el.project) or None
+
+    @property
+    def folder(self):
+        return OmniNode(self.project.folder) or None
+
+    def is_folder(self):
+        return (self.el.tag == 'folder')
+
+    def is_project(self):
+        return (self.project is not None)
+
 
 class OmniDB(object):
-    def __init__(self, username):
+    def __init__(self, username, client):
         self.path = 'dbs/%s/OmniFocus.ofocus' % username
         self.username = username
+        self.client = client
         self.main = None
         self.delta = None
+        self._load()
 
     @property
     def root(self):
@@ -75,11 +156,14 @@ class OmniDB(object):
             raise OmniDB.NotReady
 
     def _load(self):
-        self.last_id = glob('%s/*=GTDTogether.client' % self.path)[-1].split('/')[-1].split('=')[0]
+        try:
+            self.last_id = glob('%s/*=GTDTogether.client' % self.path)[-1].split('/')[-1].split('=')[0]
+        except IndexError:
+            self.last_id = None
         main, deltas = [], []
         stack = main
         for zfile in iglob('%s/*.zip' % self.path):
-            stack.append(etree.parse(ZipFile(zfile).open('contents.xml'), etree.XMLParser(remove_blank_text=True)))
+            stack.append(objectify.parse(ZipFile(zfile).open('contents.xml'), etree.XMLParser(remove_blank_text=True)))
             if zfile.split('/')[-1].split('+')[1].split('.')[0] == self.last_id:
                 stack = deltas
         self.main = main.pop(0)
@@ -151,8 +235,8 @@ class OmniDB(object):
                     base.remove(el)
 
     def insert(self, el):
-        """ This should only be used when you know you are
-            inserting a new element into the database.
+        """ Insert an element into `self.main`
+            TODO this isn't update-safe; should it be?
         """
         self.root.append(el)
         self.changes.append(el)
@@ -168,50 +252,59 @@ class OmniDB(object):
         self.changes.append(el)
         return self
 
+    def xpath(self, query, base=None):
+        if base is None:
+            base = self.root
+        return base.xpath(query, namespaces={'of': "http://www.omnigroup.com/namespace/OmniFocus/v1"})
+
+    def get(self, node, id):
+        try:
+            return self.xpath("//%s[@id='%s']" % (node, id))[0]
+        except IndexError:
+            raise OmniDB.ElementNotFound
+
     def _generate_id(self):
         """ Generate a unique OmniFocus ID. """
         id = ''.join(random.choice(string.ascii_letters) for i in xrange(11))
-        if self.xpath("//[@id='%s']" % id):
+        if self.xpath("//*[@id='%s']" % id):
             return self._generate_id()
         return id
-
-    def create_context(self, name, idref=None):
-        """ Create a context node """
-        ctx = etree.Element('context')
-        ctx.attrib['id'] = self._generate_id()
-        added_el = etree.SubElement(ctx, 'added')
-        added_el.text = '%s' % OmniDate(datetime.now())
-        ctx.append(added_el)
-        name_el = etree.SubElement(ctx, 'name')
-        name_el.text = name
-        ctx.append(name_el)
-        rank_el = etree.SubElement(ctx, 'rank')
-        rank_el.text = '0'
-        ctx.append(rank_el)
-        return ctx
 
     def create_root(self):
         """ Create a root <omnifocus /> node with all
             the required attributes.
         """
-        root = etree.Element('omnifocus')
-        root.attrib['xmlns'] = 'http://www.omnigroup.com/namespace/OmniFocus/v1'
-        root.attrib['app-id'] = 'com.omnigroup.OmniFocus'
-        root.attrib['app-version'] = '77.41.6.0.121031'
-        root.attrib['os-name'] = 'NSMACHOperatingSystem'
-        root.attrib['os-version'] = '10.6.2'
-        root.attrib['machine-model'] = 'Xserve3,1'
+        root = objectify.Element('omnifocus')
+        root.set('xmlns', 'http://www.omnigroup.com/namespace/OmniFocus/v1')
+        root.set('app-id', 'com.omnigroup.OmniFocus')
+        root.set('app-version', '77.41.6.0.121031')
+        root.set('os-name','NSMACHOperatingSystem')
+        root.set('os-version','10.6.2')
+        root.set('machine-model', 'Xserve3,1')
         return root
 
-    def xpath(self, query, base=None):
-        if base is None:
-            base = self.root
-        return etree.xpath(base, query, namespaces={})
+    def create_context(self, name, id=None, idref=None):
+        """ Create a context node """
+        ctx = objectify.Element('context')
+        ctx.set('id', id or self._generate_id())
+        ctx.added = '%s' % OmniDate.now().xml
+        ctx.name = name.decode('utf-8')
+        ctx.rank = 0
+        return ctx
+
+    class NotReady(Exception):
+        pass
+
+    class ElementNotFound(Exception):
+        pass
 
 
 class OmniClient(object):
     client_id = 'GTDTogether'
     mac_addr = 'de:ad:be:ef:ca:fe'
+
+    def __init__(self, sharer):
+        self.sharer = sharer
 
     def generate_file(self, timestamp, id):
         """ Generate a .client file. """
@@ -251,52 +344,150 @@ class OmniDelegateManager(object):
 
     def __init__(self, sharer):
         self.sharer = sharer
+        self.db = OmniDB(sharer.username)
         self._load()
 
     def _load(self):
         """ Load the required delegation contexts, creating them
             if they do not exist.
         """
-        def get_or_create(id, name, idref=None):
-            try:
-                if id is None:
-                    raise OmniDB.ElementNotFound()
-                el = self.sharer.db.get('context', id)
-            except OmniDB.ElementNotFound:
-                el = self.sharer.db.create_context(name, id, idref)
-            return el
-        ids = {}
-        # Load any knows IDs from the database
+        if not self.sharer.sql.delegate_contexts.root:
+            self._init()
+        self.contexts['root'] = OmniDelegateContext(self.db.get('context', self.sharer.sql.delegate_contexts.root))
         for key in OmniDelegateManager._contexts.iterkeys():
-            ids[key] = getattr(self.sql.delegate_contexts, key)
-        # Populate `self.contexts` with OmniDelegateContext instances, creating contexts if necessary
-        self.contexts['root'] = OmniDelegateContext(get_or_create(ids['root'], 'GTD Together™'))
-        ids['root'] = self.sql.delegate.contexts.root = self.contexts['root'].el.attrib['id']
-        for key, id in ids.iteritems():
-            self.contexts[key] = OmniDelegateContext(get_or_create(id, OmniDelegateManager._contexts[key], ids['root']))
-        # Update the database with any amended IDs
-        for key in OmniDelegateManager._contexts.iterkeys():
-            setattr(self.sql.delegate_contexts, key, ids[key])
+            id = getattr(self.sharer.sql.delegate_contexts, key)
+            if id:
+                self.contexts[key] = self.new(self.db.get('context', id))
+            else:
+                self.contexts[key] = self._create_context(key)
+
+    def _init(self):
+        ctx = self.db.create_context(u'GTD Together™')
+        self.sharer.sql.delegate_contexts.root = ctx.get('id')
+        self.db.insert(ctx).commit()
+
+    def _create_context(self, type):
+        """ Internal function used for creating root delegate contexts. """
+        ctx = self.db.create_context(OmniDelegateManager._contexts[type], idref=self.contexts['root'].id)
+        setattr(self.sharer.sql.delegate_contexts, type, ctx.get('id'))
+        self.db.insert(ctx).commit()
+        return self.new(ctx)
 
 
 class OmniDelegateContext(object):
     """ Convenience Class to automate the creation of required delegate contexts. """
-    def __init__(self, el):
+    # The context type (root, user) and delegation type (incoming, pending, accepted, declined, completed)
+    _type = None
+    # The direct parent context, if available
+    _parent = None
+    # The root delegate context
+    _root = None
+    # The context's path relative to it's root user node
+    _path = None
+
+    def __init__(self, el, manager):
         self.el = el
+        self.manager = manager
+
+    def __getitem__(self, key):
+        """ Allow use of context[child] to seemlessly get/create a delegate context. """
+        key = '@%s' % key if self.type[0] == 'root' else key
+        for child in self.children:
+            if child.el.name.text == key:
+                return child
+        el = self.sharer.db.create_context(key, idref=self.el.attrib['id'])
+        ## TODO We should probably have our own OmniDB object so we can do our own transactions here
+        ## and just force a reload of the sharer's DB if we update anything.
+        self.sharer.db.append(el).commit()
+        return self.new(el)
+
+    def new(self, el):
+        """ Create a new OmniDelegateContext object with the same
+            manager as this one.
+        """
+        return OmniDelegateContext(el, self.manager)
+
+    @property
+    def parent(self):
+        """ Shortcut to parent context. """
+        if self.type[0] == 'root':
+            return None
+        return self.new(self.sharer.db.xpath("//of:task[@id='%s']/.." % self.el.attrib['id'])[0])
+
+    @property
+    def root(self):
+        """ Resolves the root context for this delegation type. """
+        if self._root:
+            return self._root
+        parent = self.parent or self
+        while parent.type != 'root':
+            parent = parent.parent
+        self._root = parent
+        return self._root
+
+    @property
+    def type(self):
+        """ A two-tuple containing the types of the Context.
+
+            The first part indicates if the context is a root context
+            or a user context:
+                root context: "Delegate To"
+                user context: "Delegate To : @user"
+                user context: "Incoming : @user : Urgent"
+
+            The second part indicates the type of delegation:
+                incoming, pending, accepted, declined, completed
+        """
+        if self._type:
+            return self._type
+        for type, context in self.manager.contexts.iteritems():
+            if self.root == context:
+                self._type = (self == self.root and 'root' or 'user', type)
+        return self._type
+
+    @property
+    def path(self):
+        """ Returns the "path" of the Context
+
+            "Incoming : @user : Tasks : Urgent" would return ['Tasks', 'Urgent']
+        """
+        if self._path:
+            return self._path
+        ascendents = [self.name]
+        parent = self.parent
+        while parent and not parent.isroot():
+            ascendents.append(parent.name)
+            parent = self.parent
+        self._path = ascendents[1:][::-1]
+        return self._path
+
+    @property
+    def id(self):
+        return self.el.get('id')
+
+    @property
+    def name(self):
+        """ Returns the context's name. """
+        return self.el.name.text
+
+    @property
+    def username(self):
+        """ Resolves the associated username if this is a
+            user delegation context. Username is always None
+            for a root delegation context.
+        """
+        if self.type[0] == 'root':
+            return None
+        el = self
+        while not el.name.text.startswith('@'):
+            el = el.parent
+        return self.name.text[1:]
 
     @property
     def children(self):
         """ Query the DB for all direct descendents of this context. """
-        return self.sharer.db.xpath("//of:task/of:task[@idref='%s']/.." % self.el.attrib['id'])
-
-    def __getitem__(self, username):
-        """ Allow use of context[username] to get/create a delegate context. """
-        for el in self.children:
-            if el.name.text == ('@%s' % username):
-                return el
-        el = self.sharer.db.create_context('@%s' % username, idref=self.el.attrib['id'])
-        self.sharer.db.generate_delta([el])
-        return OmniDelegateContext(el)
+        for child in self.sharer.db.xpath("//of:task/of:task[@idref='%s']/.." % self.el.attrib['id']).iter():
+            yield OmniDelegateContext.new(child)
 
 
 class OmniSharer(object):
@@ -317,17 +508,13 @@ class OmniSharer(object):
         """ Parse new changes to the database and take
             appropriate action for any delegated changes.
         """
-        contexts = dict((el.attrib['id'], el) for rdc in self.delegate.itervalues() for el in rdc.itervalues())
-        for task in self.db.tasks:
-            if task.context.attrib['idref'] in contexts.values():
-                type = contexts[task.context.attrib['idref']].parent.type
-                target = OmniSharer(contexts[task.context.attrib['idref']].name[1:])
-                if type == 'delegated':
-                    # this should be in `target.incoming_task`
-                    el = copy(task)
-                    el.context.attrib['idref'] = target.delegate[type][target.username]
-                    target.db.append(el)
-                    target.db.commit()
+        for task in self.db.delta.task:
+            context = OmniDelegateContext(task.context, self.delegate)
+            if not context.isroot() and context.root == self.delegate.pending:
+                target = OmniSharer(context.username)
+                el = copy(task)
+                el.context.set('idref', target.delegate.incoming[self.username].get('id'))
+                target.db.append(el).commit()
         self._track_tasks()
 
     def _track_tasks(self):
@@ -355,3 +542,24 @@ class OmniSharer(object):
                 if el is not None:
                     target.db.append(el)
                     target.db.commit()
+
+    def find_project(self, path):
+        """ Find the best-match for an external project.
+            `path` should be a list of project names ['Company', 'Website'].
+
+            First a project of matching name is looked for, regardless of heirarchy.
+            If one is found, that project is returned. If two or more are found, the
+            one which matches `path` exactly will be is return, failing that `None`.
+
+            TODO "Fuzzy" matching, if the paths share the same head/tail.
+        """
+        projects = self.xpath('/of:omnifocus/of:task/of:project[@id]/../of:name[text()="%s"]../of:project' % path[-1])
+        if projects:
+            return None
+        elif len(projects) == 1:
+            return projects[0]
+        else:
+            for project in projects:
+                if OmniNode.path(project) == path:
+                    return project
+            return None
