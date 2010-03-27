@@ -6,7 +6,7 @@
     * I'm concerned that adding changes to an `OmniSharer` isn't nice
         enough, and maybe be liable to generating deltas without the
         appropriate "update" operation
-    * Take another look at the `OmniDB.append` code, should there be
+    * Take another look at the `OmniDb.append` code, should there be
         a friendlier API for adding changes to a database? Via `OmniSharer`?
         - update_node
         - update_task
@@ -22,7 +22,7 @@
     * Loading of the XML database should properly follow the file ids
         and not just glob() over the .ofocus
         - hopefully doing this would result in some clarity over
-            `OmniDB.last_id` and `OmniDB.last_delta_id`
+            `OmniDb.last_id` and `OmniDb.last_delta_id`
     * XML Transactions are currently extremely buggy and pretty much
         don't work properly.
         - merge delta into main on load and generate a delta, but keep
@@ -37,7 +37,7 @@
 """
 from copy import copy
 from datetime import datetime
-from glob import glob, iglob
+from glob import glob
 import plistlib
 import string
 import random
@@ -67,14 +67,14 @@ class OmniNode(object):
     def __init__(self, el):
         if el.get('idref'):
             try:
-                el = self.xpath('/of:omnifocus/of:%s[@id="%s"]' % (el.tag, el.get('idref')))[0]
+                el = self._xpath('/of:omnifocus/of:%s[@id="%s"]' % (el.tag, el.get('idref')))[0]
             except IndexError:
-                return OmniDB.ElementNotFound
+                return OmniDb.ElementNotFound
         self.el = el
 
-    def xpath(self, query, base=None):
-        # methinks using OmniDB instance methods like this is bad.
-        return OmniNode(el for el in OmniDB.xpath(None, query, base))
+    def _xpath(self, query, base=None):
+        # methinks using OmniDb instance methods like this is bad.
+        return OmniNode(el for el in OmniDb._xpath(None, query, base))
 
     @property
     def id(self):
@@ -95,14 +95,14 @@ class OmniNode(object):
             except AttributeError:
                 return None
         try:
-            return self.xpath('/of:omnifocus/of:folder|of:task[@id="%s"]' % id)[0]
+            return self._xpath('/of:omnifocus/of:folder|of:task[@id="%s"]' % id)[0]
         except IndexError:
             pass
         return None
 
     @property
     def children(self):
-        return self.xpath('//of:%s[@idref="%s"]/..' % (self.el.tag, self.el.get('id')))
+        return self._xpath('//of:%s[@idref="%s"]/..' % (self.el.tag, self.el.get('id')))
 
     @property
     def path(self):
@@ -133,96 +133,69 @@ class OmniNode(object):
         return (self.project is not None)
 
 
-class OmniDB(object):
+class OmniDb(object):
     def __init__(self, username, client):
         self.path = 'dbs/%s/OmniFocus.ofocus' % username
         self.username = username
-        self.client = client
-        self.main = None
-        self.delta = None
-        self.changes = []
+        self._client = client
+        self._tail_id = None
+        self._main = None
+        self._delta = None
+        self._changes = []
         self._load()
 
     @property
     def root(self):
         try:
-            return self.main.getroot()
+            return self._main.getroot()
         except AttributeError:
-            raise OmniDB.NotReady
-
-    def _load(self):
-        try:
-            self.last_id = self.client._get_last_sync()
-        except OmniClient.NewDB:
-            self.last_id = None
-        main, deltas = [], []
-        stack = main
-        for zfile in iglob('%s/*.zip' % self.path):
-            stack.append(objectify.parse(ZipFile(zfile).open('contents.xml'), etree.XMLParser(remove_blank_text=True)))
-            if zfile.split('/')[-1].split('+')[1].split('.')[0] == self.last_id:
-                stack = deltas
-        self.main = main.pop(0)
-        for tree in main:
-            self._merge_delta(tree)
-        self.delta = self.create_root()
-        for tree in deltas:
-            self._merge_delta(tree, self.delta)
-
-    def reload(self):
-        """ Undo all merged yet uncommitted changes from `main`
-            and reload the database upto the last known point.
-        """
-        self._load()
-        return self
-
-    def commit(self):
-        """ Commit all changes to the OmniFocus database. """
-        self.reload()            # reload `self.main` and `self.delta` (discarding changes to self.main)
-        self.merge()             # merge `self.delta` into `self.main` and write .client file
-        self._generate_delta()   # generate deltas for `self.changes`
-        self.reload()            # reload `self.main` and `self.delta` (incorporating new changes)
-        return self
-
-    def _generate_delta(self):
-        """ Generate a delta file for each change
-            and then a client file.
-        """
-        id = self._generate_id()
-        timestamp = OmniDate.now()
-        filename = '%s/%s=%s+%s.zip' % (self.path, timestamp.filename, self.last_id, id)
-        root = self.create_root()
-        while self.changes:
-            root.append(self.changes.pop(0))
-        zf = ZipFile(filename, 'w')
-        zf.writestr('contents.xml', etree.tostring(root, encoding='utf-8', standalone=False))
-        zf.close()
-        self.client.generate_file(timestamp, id)
-        self.last_id = id
-
-    def merge(self):
-        """ Merge the unknown deltas into `main` and generate a .client file """
-        self._merge_delta(self.delta)
-        self.delta = self.create_root()
-        self.client.generate_file(OmniDate.now(), self.last_id or self.last_delta_id)
-        self.last_id = self.client._get_last_sync()
-        return self
+            raise OmniDb.NotReady
 
     @property
-    def last_delta_id(self):
-        return glob('%s/*.zip' % self.path)[-1].split('/')[-1].split('+')[1].split('.')[0]
+    def delta(self):
+        if self._delta is None:
+            raise OmniDb.NotReady
+        return self._delta
+
+    def _load(self):
+        main, deltas = [], []; stack = main
+        self._tail_id = self._client.head_id
+        # filename format: (timestamp|0000…)=(head_id)+(tail_id).zip
+        next_file = lambda: '%s/*=%s+*.zip' % (self.path, self._tail_id)
+        get_tail_id = lambda fn: fn.split('/')[-1].split('+')[1].split('.')[0]
+        # iterate over the tail_ids
+        matches = glob(next_file())
+        while matches:
+            fn = matches[0]
+            # 'objectify' the xml and append it to the appropriate stack
+            stack.append(objectify.parse(ZipFile(fn).open('contents.xml'), etree.XMLParser(remove_blank_text=True)))
+            self._tail_id = get_tail_id(fn)
+            if self._tail_id == self._client.tail_id:
+                # if this is the last tail_id we have seen, start building `delta`
+                stack = deltas
+            matches = glob(next_file())
+        self._main = main.pop(0)
+        # merge `main` and `deltas` into one tree at `self.root` and `self.delta` respectively
+        for tree in main:
+            self._merge_delta(tree)
+        self._delta = self.create_root()
+        for tree in deltas:
+            self._merge_delta(tree, self._delta)
+        # merge `self.delta` into `self.root` (for continuity) but keep `self.delta` populated
+        self._merge_delta(self.delta)
 
     def _merge_delta(self, delta, base=None):
         """ Merge `delta` into `base`. """
         if base is None:
             base = self.root
         for node_type in ('context', 'task'):
-            for el in self.xpath('/of:omnifocus/of:%s' % node_type, delta):
+            for el in self._xpath('/of:omnifocus/of:%s' % node_type, delta):
                 op = el.attrib.get('op', None)
                 if op == 'update':
                     # if the task has op=update then replace
                     # the task element in the db with the new element
                     try:
-                        orig = self.xpath("/of:omnifocus/of:%s[@id='%s']" % (node_type, el.attrib['id']), base)[0]
+                        orig = self._xpath("/of:omnifocus/of:%s[@id='%s']" % (node_type, el.attrib['id']), base)[0]
                         base.remove(orig)
                     except IndexError:
                         pass
@@ -235,57 +208,165 @@ class OmniDB(object):
                     ## FIXME I suspect this is wrong, and the node is simply marked as deleted
                     base.remove(el)
 
-    def insert(self, el):
-        """ Insert an element into `self.main`
-            TODO this isn't update-safe; should it be?
+    def _generate_delta(self):
+        """ Generate a delta file for changes
+            and then a client file.
+        """
+        id = self._generate_id()
+        timestamp = OmniDate.now()
+        filename = '%s/%s=%s+%s.zip' % (self.path, timestamp.filename, self._tail_id, id)
+        delta = self.create_root()
+        while self._changes:
+            delta.append(self._changes.pop(0))
+        zf = ZipFile(filename, 'w')
+        zf.writestr('contents.xml', etree.tostring(delta, encoding='utf-8', standalone=False))
+        zf.close()
+        self._client.generate_file(timestamp, id)
+        self._tail_id = id
+
+    def _insert(self, el):
+        """ Insert element directly into `self.root`
+            TODO: check if el.tagName[el.get('id')] exists!
         """
         self.root.append(el)
-        self.changes.append(el)
-        return self
 
-    def remove(self, el):
-        """ Remove an element from `self.main` and
-            add an op=delete change.
-        """
-        self.root.remove(el)
-        delta = copy(el)
-        delta.attrib['op'] = 'delete'
-        self.changes.append(el)
-        return self
+    def _remove(self, el):
+        """ Remove an element from `self.root`. """
+        self.root.rmeove(el)
 
-    def xpath(self, query, base=None):
+    def _xpath(self, query, base=None):
         if base is None:
             base = self.root
         return base.xpath(query, namespaces={'of': "http://www.omnigroup.com/namespace/OmniFocus/v1"})
 
-    def get(self, node, id):
-        try:
-            return self.xpath("//of:%s[@id='%s']" % (node, id))[0]
-        except IndexError:
-            raise OmniDB.ElementNotFound
-
-    def get_project(self, name, folder=''):
-        if folder:
-            folder = 'of:folder[@idref="%s"]/' % folder
-        try:
-            return self.xpath('//of:project/%s../task[@idref="%s"]/..' % (name, folder))[0]
-        except IndexError:
-            raise OmniDB.ElementNotFound
-
-    def get_folder(self, name, parent=''):
-        if parent:
-            parent = 'of:folder[@idref="%s"]/' % parent
-        try:
-            return self.xpath('/of:omnifocus/of:folder/of:name[text()="%s"]..%s' % (name, parent))[0]
-        except IndexError:
-            raise OmniDB.ElementNotFound
-
     def _generate_id(self):
         """ Generate a unique OmniFocus ID. """
         id = ''.join(random.choice(string.ascii_letters) for i in xrange(11))
-        if self.xpath("//*[@id='%s']" % id):
+        if self._xpath("//*[@id='%s']" % id):
             return self._generate_id()
         return id
+
+    ##
+    # Public API Functions
+    ##
+
+    ## Transaction Functions
+
+    def reload(self):
+        """ Undo all merged yet uncommitted changes from `main`
+            and reload the database upto the last known point.
+        """
+        self._load()
+        return self
+
+    def commit(self):
+        """ Commit all changes to the OmniFocus database. """
+        self._generate_delta()   # generate deltas for `self._changes`
+        self.reload()            # reload `self.root` and `self.delta` (incorporating new changes)
+        return self
+
+    ## Manipulation Functions
+
+    def insert(self, el):
+        """ Insert an element into `self.root` and
+            add an appropriate `change`.
+        """
+        self._insert(el)
+        ## TODO did el exist? op=update or new?
+        self._changes.append(el)
+        return self
+
+    def remove(self, el):
+        """ Remove an element from `self.root` and
+            add an op=delete change.
+        """
+        self._remove(el)
+        delta = copy(el)
+        delta.attrib['op'] = 'delete'
+        self._changes.append(el)
+        return self
+
+    ## DB/DOM Query Functions
+
+    def filter(self, node, id=''):
+        """ Return all matching <node> elements,
+            optionally with an id="id" attribute.
+        """
+        if id:
+            id = '[@id="%s"]' % id
+        result = self._xpath('//of:%s%s' % (node, id))
+        if not result:
+            raise OmniDb.ElementNotFound
+        return result
+
+    def get(self, node, id):
+        """ Attempt to fetch a unique <node id="id"> element. """
+        results = self.filter(node, id)
+        if len(results) > 1:
+            raise OmniDb.MultipleElementsFound
+        return results[0]
+
+    def get_project(self, name, folder=''):
+        """ Attempt to retrieve a named project.
+
+            If not folder is specified, then all matching
+            projects will be returned, regardless of heirarchy
+            If a folder of `None` is specified, a matching root
+            project will be looked for.
+
+            Returns projects as `OmniNode` elements, or raises
+            `OmniDb.ElementNotFound`
+        """
+        query = '//of:project/%s../of:name[text()="%s"]/..'
+        if folder:
+            folder = 'of:folder[@idref="%s"]' % folder
+            try:
+                el = self._xpath(query % (folder, name))[0]
+                return OmniNode(el)
+            except IndexError:
+                return OmniDb.ElementNotFound
+        else:
+            projects = self._xpath(query % (folder or '', name))
+            if not projects:
+                return OmniDb.ElementNotFound
+            if folder is None:
+                for project in projects:
+                    if not hasattr(project, 'task'):
+                        return OmniNode(project)
+            else:
+                return [OmniNode(project) for project in projects]
+
+    def get_folder(self, name, parent=''):
+        """ Attempt to retrieve a named folder.
+
+            If not parent is specified, then all matching
+            folders will be returned, regardless of heirarchy
+            If a parent of `None` is specified, a matching root
+            folder will be looked for.
+
+            Returns folders as `OmniNode` elements, or raises
+            `OmniDb.ElementNotFound`
+        """
+        query = '/of:omnifocus/of:folder/of:name[text()="%s"]/..%s'
+        if parent:
+            parent = 'of:folder[@idref="%s"]/..' % parent
+            try:
+                el = self._xpath(query % (name, parent))[0]
+                return OmniNode(el)
+            except IndexError:
+                raise OmniDb.ElementNotFound
+        else:
+            folders = self._xpath(query % (name, parent or ''))
+            if not folders:
+                raise OmniDb.ElementNotFound
+            if parent is None:
+                for folder in folders:
+                    if not hasattr(folder, 'folder'):
+                        return OmniNode(folder)
+            else:
+                return [OmniNode(folder) for folder in folders]
+
+    ## Element Creation
 
     def create_root(self):
         """ Create a root <omnifocus /> node with all
@@ -300,7 +381,7 @@ class OmniDB(object):
         root.set('machine-model', 'Xserve3,1')
         return root
 
-    def create_context(self, name, id=None, idref=None):
+    def create_context(self, name, id=None, idref=None, rank=None):
         """ Create a context node """
         ctx = objectify.Element('context')
         ctx.set('id', id or self._generate_id())
@@ -309,10 +390,18 @@ class OmniDB(object):
             ctx.context.set('idref', idref)
         ctx.added = '%s' % OmniDate.now().xml
         ctx.name = name
-        ctx.rank = 0
+        ctx.rank = rank or 0
         return ctx
 
+    ## Exceptions
+
     class NotReady(Exception):
+        """ Should never get raised really.
+            TODO factor this out.
+        """
+        pass
+
+    class MultipleElementsFound(Exception):
         pass
 
     class ElementNotFound(Exception):
@@ -325,12 +414,23 @@ class OmniClient(object):
 
     def __init__(self, sharer):
         self.sharer = sharer
+        self.path = 'dbs/%s/OmniFocus.ofocus' % sharer.username
 
-    def _get_last_sync(self):
+    @property
+    def head_id(self):
+        """ Get the head id of the database.
+            0000…=(head)+(tail).zip
+        """
+        fn = glob('%s/00000000000000=*.zip' % self.path)[0]
+        return fn.split('/')[-1].split('=')[1].split('+')[0]
+
+    @property
+    def tail_id(self):
+        """ Read the tailIdentifier from the last time we synced. """
         try:
-            fn = glob('dbs/%s/OmniFocus.ofocus/*=GTDTogether.client' % self.sharer.username)[-1]
+            fn = glob('%s/*=GTDTogether.client' % self.path)[-1]
         except IndexError:
-            raise OmniClient.NewDB
+            return None
         pl = plistlib.readPlist(fn)
         try:
             return pl['tailIdentifiers'][0]
@@ -381,7 +481,7 @@ class OmniDelegateManager(object):
 
     def __init__(self, sharer):
         self.sharer = sharer
-        self.db = OmniDB(sharer.username, sharer.client)
+        self.db = OmniDb(sharer.username, sharer.client)
         self._load()
 
     def _load(self):
@@ -410,7 +510,7 @@ class OmniDelegateManager(object):
         ctx = self.db.create_context(OmniDelegateManager._contexts[type], idref=self.contexts['root'].id)
         setattr(self.sharer.sql.delegate_contexts, type, ctx.get('id'))
         self.db.insert(ctx)
-        self.sharer.db.root.append(ctx)
+        self.sharer.db._insert(ctx)
         if commit:
             self.db.commit()
         return OmniDelegateContext(ctx, self)
@@ -524,7 +624,7 @@ class OmniDelegateContext(object):
     @property
     def children(self):
         """ Query the DB for all direct descendents of this context. """
-        for child in self.sharer.db.xpath("//of:task/of:task[@idref='%s']/.." % self.el.attrib['id']).iter():
+        for child in self.sharer.db._xpath("//of:task/of:task[@idref='%s']/.." % self.el.attrib['id']).iter():
             yield OmniDelegateContext.new(child)
 
 
@@ -540,7 +640,7 @@ class OmniSharer(object):
         self.username = username
         self.sql = GTDTDb(username)
         self.client = OmniClient(self)
-        self.db = OmniDB(username, self.client)
+        self.db = OmniDb(username, self.client)
         self.delegate = OmniDelegateManager(self)
 
     def parse(self):
@@ -570,7 +670,7 @@ class OmniSharer(object):
             for task_id in self.sql.assigned_tasks[delegator]:
                 try:
                     task = self.db.get("//task[@id='%s']" % id, self.delta)
-                except OmniDB.ElementNotFound:
+                except OmniDb.ElementNotFound:
                     continue
                 # possible actions here? Accepted, Declined, Completed, (Updated)
                 ## TODO updates to task, namely the notes field, need to be replicated
@@ -599,7 +699,7 @@ class OmniSharer(object):
 
             TODO "Fuzzy" matching, if the paths share the same head/tail.
         """
-        projects = self.xpath('/of:omnifocus/of:task/of:project[@id]/../of:name[text()="%s"]../of:project' % path[-1])
+        projects = self._xpath('/of:omnifocus/of:task/of:project[@id]/../of:name[text()="%s"]../of:project' % path[-1])
         if projects:
             return None
         elif len(projects) == 1:
