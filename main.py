@@ -1,39 +1,19 @@
 #!/usr/bin/env python
 # vim: set fileencoding=utf-8 :
 """
-    # 21/03 03:00
-
-    * I'm concerned that adding changes to an `OmniSharer` isn't nice
-        enough, and maybe be liable to generating deltas without the
-        appropriate "update" operation
-    * Take another look at the `OmniDb.append` code, should there be
-        a friendlier API for adding changes to a database? Via `OmniSharer`?
-        - update_node
-        - update_task
-        - add_task
-    * A lot of the XML-traversal code is currently pseudo and probably
-        won't work
-
-
     # 27/03 00:30
     A lot more stuff is working now, but I'm going to commit so I have
     a snapshot, as I think a lot of core stuff needs rejigging:
 
-    * Loading of the XML database should properly follow the file ids
-        and not just glob() over the .ofocus
-        - hopefully doing this would result in some clarity over
-            `OmniDb.last_id` and `OmniDb.last_delta_id`
-    * XML Transactions are currently extremely buggy and pretty much
-        don't work properly.
-        - merge delta into main on load and generate a delta, but keep
-            a record of the new changes to the db?
-    * The OmniDelegateManager is currently inserting directly into it's
-        parent OmniSharer's db.main; this doesn't feel very nice. Under a
-        nicer transactional system, we could force a reload after we commit()
     * The DB structure and ORM need to be given some consideration in regards to
         tracked tasks.
             - username|task_id|delegatee?
     * `OmniClient` is still using placeholder values for a lot of stuff
+
+    # 27/03 23:15
+
+    * `OmniDb.insert` is still not "update aware".
+    * Major issues with `OmniDelegateContext`'s `type`, `parent` and `root` methods
 """
 from copy import copy
 from datetime import datetime
