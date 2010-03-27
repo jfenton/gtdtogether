@@ -13,47 +13,39 @@
         - add_task
     * A lot of the XML-traversal code is currently pseudo and probably
         won't work
-    * It may be worth adding an `OmniDBNode` object to handle traversal
-        in a nicer manner (means hacking about with __getattr__ though :/)
-    * The GTDDB class needs improving somewhat to handle assigned and
-        delegated tasks
+
+
+    # 27/03 00:30
+    A lot more stuff is working now, but I'm going to commit so I have
+    a snapshot, as I think a lot of core stuff needs rejigging:
+
+    * Loading of the XML database should properly follow the file ids
+        and not just glob() over the .ofocus
+        - hopefully doing this would result in some clarity over
+            `OmniDB.last_id` and `OmniDB.last_delta_id`
+    * XML Transactions are currently extremely buggy and pretty much
+        don't work properly.
+        - merge delta into main on load and generate a delta, but keep
+            a record of the new changes to the db?
+    * The OmniDelegateManager is currently inserting directly into it's
+        parent OmniSharer's db.main; this doesn't feel very nice. Under a
+        nicer transactional system, we could force a reload after we commit()
+    * The DB structure and ORM need to be given some consideration in regards to
+        tracked tasks.
+            - username|task_id|delegatee?
+    * `OmniClient` is still using placeholder values for a lot of stuff
 """
 from copy import copy
 from datetime import datetime
 from glob import glob, iglob
 import plistlib
 import string
-import sqlite3
 import random
 from zipfile import ZipFile
 
 from lxml import etree, objectify
 
-
-class GTDDBRow(object):
-    def __init__(self, username, row):
-        self.username = username
-        self.row = dict((col, row[col]) for col in row.keys())
-
-    def __getattr__(self, name):
-        try:
-            return self.row[name]
-        except KeyError:
-            raise AttributeError
-
-
-class GTDDB(object):
-    """ Basic Interface to the GTDTogether Database. """
-    tables = ('config', 'delegate_contexts')
-
-    def __init__(self, username):
-        self.username = username
-        self.conn = sqlite3.connect('db.sqlite')
-        self.conn.row_factory = sqlite3.Row
-        cursor = self.conn.cursor()
-        for table in GTDDB.tables:
-            cursor.execute('SELECT * FROM %s WHERE username=?' % table, (self.username,))
-            setattr(self, table, GTDDBRow(username, cursor.fetchone()))
+from gtdt import GTDTDb
 
 
 class OmniDate(datetime):
@@ -62,14 +54,16 @@ class OmniDate(datetime):
     """
     @property
     def filename(self):
+        """ Used in db filenames """
         return self.strftime('%Y%m%d%H%M%S')
 
     @property
     def xml(self):
+        """ Used inside plists and the xml db """
         return '%sZ' % self.isoformat()[:-3]
 
 class OmniNode(object):
-    """ Generic class to provide an interface to the OmniFocus task heirarchy. """
+    """ Generic class to provide an interface to the OmniFocus folder/task heirarchy. """
     def __init__(self, el):
         if el.get('idref'):
             try:
@@ -146,6 +140,7 @@ class OmniDB(object):
         self.client = client
         self.main = None
         self.delta = None
+        self.changes = []
         self._load()
 
     @property
@@ -157,8 +152,8 @@ class OmniDB(object):
 
     def _load(self):
         try:
-            self.last_id = glob('%s/*=GTDTogether.client' % self.path)[-1].split('/')[-1].split('=')[0]
-        except IndexError:
+            self.last_id = self.client._get_last_sync()
+        except OmniClient.NewDB:
             self.last_id = None
         main, deltas = [], []
         stack = main
@@ -182,9 +177,10 @@ class OmniDB(object):
 
     def commit(self):
         """ Commit all changes to the OmniFocus database. """
+        self.reload()            # reload `self.main` and `self.delta` (discarding changes to self.main)
+        self.merge()             # merge `self.delta` into `self.main` and write .client file
         self._generate_delta()   # generate deltas for `self.changes`
         self.reload()            # reload `self.main` and `self.delta` (incorporating new changes)
-        self.merge()             # merge `self.delta` into `self.main` and write .client file
         return self
 
     def _generate_delta(self):
@@ -192,23 +188,28 @@ class OmniDB(object):
             and then a client file.
         """
         id = self._generate_id()
-        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        filename = '%s/%s=%s+%s.zip' % (self.dbpath, timestamp, self._last_id, id)
+        timestamp = OmniDate.now()
+        filename = '%s/%s=%s+%s.zip' % (self.path, timestamp.filename, self.last_id, id)
         root = self.create_root()
-        for node in self.changes:
-            root.append(node)
+        while self.changes:
+            root.append(self.changes.pop(0))
         zf = ZipFile(filename, 'w')
         zf.writestr('contents.xml', etree.tostring(root, encoding='utf-8', standalone=False))
         zf.close()
-        self.client.generate(timestamp, id)
+        self.client.generate_file(timestamp, id)
+        self.last_id = id
 
     def merge(self):
         """ Merge the unknown deltas into `main` and generate a .client file """
         self._merge_delta(self.delta)
         self.delta = self.create_root()
-        self.client.create_file(datetime.now(), self.last_id)
-        self.sql.config.last_id = 'TODO'  ## TODO!
+        self.client.generate_file(OmniDate.now(), self.last_id or self.last_delta_id)
+        self.last_id = self.client._get_last_sync()
         return self
+
+    @property
+    def last_delta_id(self):
+        return glob('%s/*.zip' % self.path)[-1].split('/')[-1].split('+')[1].split('.')[0]
 
     def _merge_delta(self, delta, base=None):
         """ Merge `delta` into `base`. """
@@ -259,7 +260,23 @@ class OmniDB(object):
 
     def get(self, node, id):
         try:
-            return self.xpath("//%s[@id='%s']" % (node, id))[0]
+            return self.xpath("//of:%s[@id='%s']" % (node, id))[0]
+        except IndexError:
+            raise OmniDB.ElementNotFound
+
+    def get_project(self, name, folder=''):
+        if folder:
+            folder = 'of:folder[@idref="%s"]/' % folder
+        try:
+            return self.xpath('//of:project/%s../task[@idref="%s"]/..' % (name, folder))[0]
+        except IndexError:
+            raise OmniDB.ElementNotFound
+
+    def get_folder(self, name, parent=''):
+        if parent:
+            parent = 'of:folder[@idref="%s"]/' % parent
+        try:
+            return self.xpath('/of:omnifocus/of:folder/of:name[text()="%s"]..%s' % (name, parent))[0]
         except IndexError:
             raise OmniDB.ElementNotFound
 
@@ -287,8 +304,11 @@ class OmniDB(object):
         """ Create a context node """
         ctx = objectify.Element('context')
         ctx.set('id', id or self._generate_id())
+        if idref:
+            ctx.context = None
+            ctx.context.set('idref', idref)
         ctx.added = '%s' % OmniDate.now().xml
-        ctx.name = name.decode('utf-8')
+        ctx.name = name
         ctx.rank = 0
         return ctx
 
@@ -306,6 +326,20 @@ class OmniClient(object):
     def __init__(self, sharer):
         self.sharer = sharer
 
+    def _get_last_sync(self):
+        try:
+            fn = glob('dbs/%s/OmniFocus.ofocus/*=GTDTogether.client' % self.sharer.username)[-1]
+        except IndexError:
+            raise OmniClient.NewDB
+        pl = plistlib.readPlist(fn)
+        try:
+            return pl['tailIdentifiers'][0]
+        except IndexError:
+            raise Exception
+        except KeyError:
+            raise Exception
+        raise Exception
+
     def generate_file(self, timestamp, id):
         """ Generate a .client file. """
         values = {
@@ -320,15 +354,18 @@ class OmniClient(object):
             'bundleVersion': '77.41.6.0.121031',
             'clientIdentifier': OmniClient.client_id,
             'hostID': OmniClient.mac_addr,
-            'lastSyncDate': '%sZ' % OmniDate(self.config.regdate).xml,  ## TODO this is wrong; parse in __init__
+            'lastSyncDate': '%sZ' % OmniDate.now().xml,  ## FIXME
             'name': 'GTDTogether',
-            'registrationDate': '%sZ' % OmniDate(self.config.regdate).xml,
+            'registrationDate': '%sZ' % OmniDate.now().xml,  ## FIXME
             'tailIdentifiers': [id],
         }
         plistlib.writePlist(values, '%s/%s=%s.client' % (self.sharer.db.path, int(timestamp.filename) + 1, OmniClient.client_id))
 
     def parse_file(self, filename):
         """ Parse the plist body of a .client file. """
+        pass
+
+    class NewDB(Exception):
         pass
 
 
@@ -344,7 +381,7 @@ class OmniDelegateManager(object):
 
     def __init__(self, sharer):
         self.sharer = sharer
-        self.db = OmniDB(sharer.username)
+        self.db = OmniDB(sharer.username, sharer.client)
         self._load()
 
     def _load(self):
@@ -353,25 +390,30 @@ class OmniDelegateManager(object):
         """
         if not self.sharer.sql.delegate_contexts.root:
             self._init()
-        self.contexts['root'] = OmniDelegateContext(self.db.get('context', self.sharer.sql.delegate_contexts.root))
+        self.contexts['root'] = OmniDelegateContext(self.db.get('context', self.sharer.sql.delegate_contexts.root), self)
         for key in OmniDelegateManager._contexts.iterkeys():
             id = getattr(self.sharer.sql.delegate_contexts, key)
             if id:
-                self.contexts[key] = self.new(self.db.get('context', id))
+                self.contexts[key] = OmniDelegateContext(self.db.get('context', id), self)
             else:
-                self.contexts[key] = self._create_context(key)
+                self.contexts[key] = self._create_context(key, commit=False)
+        self.db.commit()
 
     def _init(self):
         ctx = self.db.create_context(u'GTD Together™')
         self.sharer.sql.delegate_contexts.root = ctx.get('id')
-        self.db.insert(ctx).commit()
+        self.db.insert(ctx)
+        self.db.commit()
 
-    def _create_context(self, type):
+    def _create_context(self, type, commit=True):
         """ Internal function used for creating root delegate contexts. """
         ctx = self.db.create_context(OmniDelegateManager._contexts[type], idref=self.contexts['root'].id)
         setattr(self.sharer.sql.delegate_contexts, type, ctx.get('id'))
-        self.db.insert(ctx).commit()
-        return self.new(ctx)
+        self.db.insert(ctx)
+        self.sharer.db.root.append(ctx)
+        if commit:
+            self.db.commit()
+        return OmniDelegateContext(ctx, self)
 
 
 class OmniDelegateContext(object):
@@ -395,11 +437,7 @@ class OmniDelegateContext(object):
         for child in self.children:
             if child.el.name.text == key:
                 return child
-        el = self.sharer.db.create_context(key, idref=self.el.attrib['id'])
-        ## TODO We should probably have our own OmniDB object so we can do our own transactions here
-        ## and just force a reload of the sharer's DB if we update anything.
-        self.sharer.db.append(el).commit()
-        return self.new(el)
+        return self.manaer._create_context(key, idref=self.el.attrib['id'])
 
     def new(self, el):
         """ Create a new OmniDelegateContext object with the same
@@ -499,7 +537,8 @@ class OmniSharer(object):
     delegate = None
 
     def __init__(self, username):
-        self.sql = GTDDB(username)
+        self.username = username
+        self.sql = GTDTDb(username)
         self.client = OmniClient(self)
         self.db = OmniDB(username, self.client)
         self.delegate = OmniDelegateManager(self)
@@ -508,18 +547,25 @@ class OmniSharer(object):
         """ Parse new changes to the database and take
             appropriate action for any delegated changes.
         """
-        for task in self.db.delta.task:
-            context = OmniDelegateContext(task.context, self.delegate)
-            if not context.isroot() and context.root == self.delegate.pending:
-                target = OmniSharer(context.username)
-                el = copy(task)
-                el.context.set('idref', target.delegate.incoming[self.username].get('id'))
-                target.db.append(el).commit()
-        self._track_tasks()
+        print etree.tostring(self.db.delta, pretty_print=True)
+        try:
+            for task in self.db.delta.task:
+                context = OmniDelegateContext(task.context, self.delegate)
+                if not context.isroot() and context.root == self.delegate.pending:
+                    target = OmniSharer(context.username)
+                    el = copy(task)
+                    el.context.set('idref', target.delegate.incoming[self.username].get('id'))
+                    target.db.append(el).commit()
+        except AttributeError:
+            pass
+        #self._track_tasks()
 
     def _track_tasks(self):
         """ Track changes to known delegated tasks. """
-        for delegator in self.sql.assigned_tasks.iterkeys():
+        # TODO FIXME
+        # this doesn't work at all
+        # I need to think about the db/orm here.
+        for delegator in self.sql.tracked_tasks.iterkeys():
             target = OmniSharer(delegator)
             for task_id in self.sql.assigned_tasks[delegator]:
                 try:
@@ -563,3 +609,7 @@ class OmniSharer(object):
                 if OmniNode.path(project) == path:
                     return project
             return None
+
+
+if __name__ == '__main__':
+    OmniSharer('wrboyce').parse()
