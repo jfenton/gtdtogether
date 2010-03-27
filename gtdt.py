@@ -9,6 +9,8 @@ class GTDTDbRow(object):
     def __init__(self, controller, table):
         self.__dict__['controller'] = controller
         self.__dict__['table'] = table
+        if not self.controller.rowcount(self.table):
+            self.controller.insert(self.table)
 
     def __getattr__(self, col):
         return self.controller.fetch(self.table, col)
@@ -26,14 +28,14 @@ class GTDTDbRowSet(GTDTDbRow):
     def __setattr__(self, col, values):
         self.controller.delete(self.table)
         for value in values:
-            self.controller.insert(self.table, col, value)
+            self.controller.insert(self.table, **{col: value})
 
     def append(self, **kwargs):
         """ Add a row to the set, currently this only supports
             one row per column, but that's all we need.
         """
         for col, value in kwargs.iteritems():
-            self.controller.insert(self.table, col, value)
+            self.controller.insert(self.table, **{col: value})
 
 
 class GTDTDb(object):
@@ -50,15 +52,18 @@ class GTDTDb(object):
         for table, cls in GTDTDb.tables.iteritems():
             setattr(self, table, cls(self, table))
 
-    def update(self, table, col, value):
+    def insert(self, table, **kwargs):
+        kwargs['username'] = self.username
         cursor = self.conn.cursor()
-        cursor.execute('UPDATE %s SET %s=? WHERE username=?' % (table, col), (value, self.username))
+        cols = ', '.join(col for col in kwargs.iterkeys())
+        values = ', '.join('?' for value in kwargs.itervalues())
+        cursor.execute('INSERT INTO %s (%s) VALUES (%s)' % (table, cols, values), kwargs.values())
         cursor.close()
         self.conn.commit()
 
-    def insert(self, table, col, value):
+    def update(self, table, col, value):
         cursor = self.conn.cursor()
-        cursor.execute('INSERT INTO %s (%s, username) VALUES (?, ?)' % (table, col), (value, self.username))
+        cursor.execute('UPDATE %s SET %s=? WHERE username=?' % (table, col), (value, self.username))
         cursor.close()
         self.conn.commit()
 
@@ -66,6 +71,11 @@ class GTDTDb(object):
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM %s WHERE USERNAME=?' % table, (self.username,))
         self.conn.commit()
+
+    def rowcount(self, table):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(username) AS rowcount FROM %s WHERE username=?' % table, (self.username,))
+        return int(cursor.fetchone()['rowcount'])
 
     def fetch(self, table, col):
         cursor = self.conn.cursor()
@@ -77,9 +87,25 @@ class GTDTDb(object):
         cursor.execute('SELECT %s FROM %s WHERE USERNAME=?' % (col, table), (self.username,))
         return (row[col] for row in cursor.fetchall())
 
+    def purge(self):
+        cursor = self.conn.cursor()
+        for table in GTDTDb.tables.iterkeys():
+            cursor.execute('DELETE FROM %s WHERE username=?' % table, (self.username,))
+        cursor.close()
+        self.conn.commit()
+
 
 class GTDTDbTest(unittest.TestCase):
     def setUp(self):
+        self.sql = GTDTDb('_test')
+
+    def tearDown(self):
+        self.sql.purge()
+
+    def test_purge(self):
+        self.sql.purge()
+        for table in GTDTDb.tables.iterkeys():
+            self.assertEqual(self.sql.rowcount(table), 0)
         self.sql = GTDTDb('_test')
 
     def test_row_insert(self):
