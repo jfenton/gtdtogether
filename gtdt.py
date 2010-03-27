@@ -119,7 +119,7 @@ class GTDTDbTest(unittest.TestCase):
     def test_set_append(self):
         self.sql.tracked_tasks.task_id = range(25)
         self.sql.tracked_tasks.append(task_id=100)
-        self.assertEqual([int(id) for id in self.sql.tracked_tasks.task_id], range(25)+[100])
+        self.assertEqual([int(id) for id in self.sql.tracked_tasks.task_id], range(25) + [100])
 
 
 if __name__ == '__main__':
